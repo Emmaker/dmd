@@ -67,11 +67,29 @@ DArray!ubyte preprocess(FileName csrcfile, Loc loc, ref OutBuffer defines)
     //printf("preprocess %s\n", csrcfile.toChars());
     version (runPreprocessor)
     {
-        const includePath = FileName.replaceName(toDString(importc_h), "include");
-        scope(exit) FileName.free(includePath.ptr);
+        // Build array of include paths for the preprocessor
+        Array!(const(char)*) allIncludePaths;
+        scope(exit)
+        {
+            foreach (path; allIncludePaths[])
+                if (path) mem.xfree(cast(void*)path);
+        }
+
+        // Add include path from importc.h
+        const(char)[] importc_hIncludePath = FileName.replaceName(toDString(importc_h), "include");
+        scope(exit) FileName.free(importc_hIncludePath.ptr);
+        allIncludePaths.push(mem.xstrdup(importc_hIncludePath.ptr));
+
+        // Add all import paths from global.importPaths
+        foreach (const path; global.importPaths[])
+        {
+            if (path)
+                allIncludePaths.push(mem.xstrdup(path));
+        }
+
         const command = global.params.cpp ? toDString(global.params.cpp) : cppCommand();
         DArray!ubyte text;
-        int status = runPreprocessor(loc, command, csrcfile.toString(), importc_h, includePath, global.params.cppswitches, global.params.v.verbose, global.errorSink, defines, text);
+        int status = runPreprocessor(loc, command, csrcfile.toString(), importc_h, allIncludePaths, global.params.cppswitches, global.params.v.verbose, global.errorSink, defines, text);
         if (status)
             fatal();
         return text;
