@@ -2614,7 +2614,7 @@ int jmpopcode(elem* e)
 
     op = e.Eoper;
     tym_t tymx = tybasic(e.Ety);
-    bool needsNanCheck = tyfloating(tymx) && config.inline8087 &&
+    bool needsNanCheck = tyfloating(tymx) && config.inline8087 && op != OPconst &&
         (tymx == TYreal || tymx == TYireal || tymx == TYcreal ||
          tymx == TYcdouble || tymx == TYcfloat ||
          (tyxmmreg(tymx) && config.fpxmmregs && e.Ecount != e.Ecomsub) ||
@@ -2807,7 +2807,7 @@ void cod3_ptrchk(ref CGstate cg, ref CodeBuilder cdb,ref code pcs,regm_t keepmsk
         {
             int push,pop;
 
-            cg.stackchanged = 1;
+            cg.stackchanged = true;
             if (i == ES)
             {   push = 0x06;
                 pop = 0x07;

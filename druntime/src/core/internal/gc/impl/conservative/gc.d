@@ -29,8 +29,7 @@ module core.internal.gc.impl.conservative.gc;
 //debug = VALGRIND;             // Valgrind memcheck integration
 
 /***************************************************/
-version (WASI) {} // WASI is single-threaded
-else
+static if (!isSingleThreaded)
 {
     version = COLLECT_PARALLEL;  // parallel scanning
 
@@ -1804,8 +1803,7 @@ struct Gcx
         usedSmallPages = usedLargePages = 0;
         mappedPages = 0;
         //printf("gcx = %p, self = %x\n", &this, self);
-        version (WASI) {}
-        else version (Posix)
+        version (Posix) static if(!isSingleThreaded)
         {
             import core.sys.posix.pthread : pthread_atfork;
             instance = &this;
@@ -3524,7 +3522,7 @@ Lmark:
         return IsMarked.unknown;
     }
 
-    version (Posix)
+    version (Posix) static if(!isSingleThreaded)
     {
         // A fork might happen while GC code is running in a different thread.
         // Because that would leave the GC in an inconsistent state,
@@ -3628,6 +3626,7 @@ Lmark:
                     scanStack!precise.push(ScanRange!precise(pbot, pbot + pointersPerThread));
                     pbot += pointersPerThread;
                 }
+                evStackFilled.setIfInitialized(); // background threads start now
                 stackLock.unlock();
             }
             if (ConservativeGC.isPrecise)
@@ -3636,8 +3635,6 @@ Lmark:
                 pushRanges!false();
         }
         assert(pbot < ptop);
-
-        evStackFilled.setIfInitialized(); // background threads start now
 
         debug(PARALLEL_PRINTF) printf("mark %lld roots\n", cast(ulong)(ptop - pbot));
 

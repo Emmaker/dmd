@@ -29,7 +29,7 @@ import dmd.dstruct;
 import dmd.dsymbol;
 import dmd.dsymbolsem;
 import dmd.dtemplate;
-import dmd.errors;
+import dmd.errors : fatal;
 import dmd.errorsink;
 import dmd.expression;
 import dmd.expressionsem;
@@ -854,6 +854,7 @@ void templateDeclarationSemantic(Scope* sc, TemplateDeclaration tempdecl)
 
     // Compute again
     tempdecl.onemember = null;
+    tempdecl.haveComputedOneMember = false;
     tempdecl.computeOneMember();
     /* BUG: should check:
      *  1. template functions must not introduce virtual functions, as they
@@ -3676,7 +3677,7 @@ const(char)* getConstraintEvalError(TemplateDeclaration td, ref const(char)* tip
         buf.writestring(msg);
         buf.writeByte('`');
         buf.writestring(sep);
-        tip = "not satisfied constraints are marked with `>`";
+        tip = "Tip: not satisfied constraints are marked with `>`";
     }
     return buf.extractChars();
 }
@@ -3862,18 +3863,18 @@ bool findBestMatch(TemplateInstance ti, Scope* sc, ArgumentList argumentList)
         {
             // Only one template, so we can give better error message
             const(char)* msg = "does not match template declaration";
-            const(char)* tip;
             OutBuffer buf;
             HdrGenState hgs;
             hgs.skipConstraints = true;
             toCharsMaybeConstraints(tdecl, buf, hgs);
             const tmsg = buf.peekChars();
+            const(char)* tip;
             const cmsg = tdecl.getConstraintEvalError(tip);
             if (cmsg)
             {
                 eSink.error(ti.loc, "%s `%s` %s `%s`\n%s", ti.kind, ti.toPrettyChars, msg, tmsg, cmsg);
                 if (tip)
-                    .tip(tip);
+                    eSink.errorSupplemental(Loc.init, tip);
             }
             else
             {
@@ -4170,7 +4171,8 @@ private RootObject defaultArg(TemplateParameter tp, Loc instLoc, Scope* sc)
  * Returns:
  *      match pair of initial and inferred template arguments
  */
-private MATCHpair deduceFunctionTemplateMatch(TemplateDeclaration td, TemplateInstance ti, Scope* sc, ref FuncDeclaration fd, Type tthis, ArgumentList argumentList)
+private MATCHpair deduceFunctionTemplateMatch(TemplateDeclaration td, TemplateInstance ti, Scope* sc, ref FuncDeclaration fd, Type tthis, ArgumentList argumentList,
+    scope void delegate(const(char)*, Loc argloc = Loc.initial) scope errorHelper = null)
 {
     version (none)
     {
@@ -4795,7 +4797,7 @@ private MATCHpair deduceFunctionTemplateMatch(TemplateDeclaration td, TemplateIn
                     {
                         if (StringExp se = farg.isStringExp())
                         {
-                            argtype = se.type.nextOf().sarrayOf(se.len);
+                            argtype = se.type.nextOf().sarrayOf(se.length);
                         }
                         else if (ArrayLiteralExp ale = farg.isArrayLiteralExp())
                         {
@@ -5122,7 +5124,16 @@ Lmatch:
                     oded = new Tuple();
                 }
                 else
+                {
+                    if (errorHelper && global.errorSink.emitAdditionalContext())
+                    {
+                        OutBuffer buf2;
+                        buf2.printf("missing argument for template parameter #%d: `%s`",
+                            cast(int) i + 1, tparam.ident.toChars());
+                        errorHelper(buf2.extractChars());
+                    }
                     return nomatch();
+                }
             }
             if (isError(oded))
                 return matcherror();
@@ -5409,7 +5420,7 @@ private RootObject declareParameter(TemplateDeclaration td, Scope* sc, TemplateP
     /* So the caller's o gets updated with the result of semantic() being run on o
      */
     if (v)
-        o = v._init.initializerToExpression();
+        o = v._init.initializerToExpression(sc, null, global.errorSink);
     return o;
 }
 
@@ -6091,7 +6102,7 @@ void functionResolve(ref MatchAccumulator m, Dsymbol dstart, Loc loc, Scope* sc,
             ti.parent = td.parent;  // Maybe calculating valid 'enclosing' is unnecessary.
 
             auto fd = f;
-            MATCHpair x = td.deduceFunctionTemplateMatch(ti, sc, fd, tthis, argumentList);
+            MATCHpair x = td.deduceFunctionTemplateMatch(ti, sc, fd, tthis, argumentList, errorHelper);
             MATCH mta = x.mta;
             MATCH mfa = x.mfa;
             //printf("match:t/f = %d/%d\n", mta, mfa);
@@ -7674,7 +7685,7 @@ MATCH deduceType(scope RootObject o, scope Scope* sc, scope Type tparam,
             if (e.type.ty == Tarray && (tparam.ty == Tsarray || tparam.ty == Taarray && (taai = (cast(TypeAArray)tparam).index).ty == Tident && (cast(TypeIdentifier)taai).idents.length == 0))
             {
                 // Consider compile-time known boundaries
-                e.type.nextOf().sarrayOf(e.len).accept(this);
+                e.type.nextOf().sarrayOf(e.length).accept(this);
                 return;
             }
             visit(cast(Expression)e);
@@ -8188,7 +8199,10 @@ private bool resolveTemplateInstantiation(Scope* sc, TemplateParameters* paramet
                 // (it may be from a parent template, for example)
             }
 
+            const errors = global.startGagging();
             e2 = e2.expressionSemantic(sc); // https://issues.dlang.org/show_bug.cgi?id=13417
+            if (global.endGagging(errors))
+                return false;
             e2 = e2.ctfeInterpret();
 
             //printf("e1 = %s, type = %s %d\n", e1.toChars(), e1.type.toChars(), e1.type.ty);

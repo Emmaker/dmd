@@ -557,7 +557,7 @@ Statement statementSemanticVisit(Statement s, Scope* sc)
 
         ScopeDsymbol sym = new ScopeDsymbol();
         sym.parent = sc.scopesym;
-        sym.endlinnum = ss.endloc.linnum;
+        sym.endloc = ss.endloc;
         sc = sc.push(sym);
 
         // for CompoundStatement flatten just returns its statements, so no need
@@ -658,6 +658,8 @@ Statement statementSemanticVisit(Statement s, Scope* sc)
 
         ds.condition = ds.condition.expressionSemantic(sc);
         ds.condition = resolveProperties(sc, ds.condition);
+        if (!ds.condition.hasValidType())
+            ds.condition = ErrorExp.get();
         if (checkNonAssignmentArrayOp(ds.condition))
             ds.condition = ErrorExp.get();
         ds.condition = ds.condition.optimize(WANTvalue);
@@ -716,7 +718,7 @@ Statement statementSemanticVisit(Statement s, Scope* sc)
 
         auto sym = new ScopeDsymbol();
         sym.parent = sc.scopesym;
-        sym.endlinnum = fs.endloc.linnum;
+        sym.endloc = fs.endloc;
         sc = sc.push(sym);
         sc.inLoop = true;
 
@@ -730,6 +732,8 @@ Statement statementSemanticVisit(Statement s, Scope* sc)
 
             fs.condition = fs.condition.expressionSemantic(sc);
             fs.condition = resolveProperties(sc, fs.condition);
+            if (!fs.condition.hasValidType())
+                fs.condition = ErrorExp.get();
             if (checkNonAssignmentArrayOp(fs.condition))
                 fs.condition = ErrorExp.get();
             fs.condition = fs.condition.optimize(WANTvalue);
@@ -817,7 +821,7 @@ Statement statementSemanticVisit(Statement s, Scope* sc)
             // https://issues.dlang.org/show_bug.cgi?id=14653
             // Extend the life of rvalue aggregate till the end of foreach.
             vinit = copyToTemp(STC.rvalue, "__aggr", fs.aggr);
-            vinit.endlinnum = fs.endloc.linnum;
+            vinit.endloc = fs.endloc;
             vinit.dsymbolSemantic(sc);
             fs.aggr = new VarExp(fs.aggr.loc, vinit);
         }
@@ -845,14 +849,14 @@ Statement statementSemanticVisit(Statement s, Scope* sc)
                 if (fs.op == TOK.foreach_reverse_)
                 {
                     eSink.errorSupplemental(fs.loc, "`foreach_reverse` works with bidirectional ranges"~
-                        " (implementing `back` and `popBack`), aggregates implementing" ~
+                        " (implementing `empty`, `back`, and `popBack`), aggregates implementing" ~
                         " `opApplyReverse`, or the result of an aggregate's `.tupleof` property");
                     eSink.errorSupplemental(fs.loc, "https://dlang.org/phobos/std_range_primitives.html#isBidirectionalRange");
                 }
                 else
                 {
                     eSink.errorSupplemental(fs.loc, "`foreach` works with input ranges"~
-                        " (implementing `front` and `popFront`), aggregates implementing" ~
+                        " (implementing `empty`, `front`, and `popFront`), aggregates implementing" ~
                         " `opApply`, or the result of an aggregate's `.tupleof` property");
                     eSink.errorSupplemental(fs.loc, "https://dlang.org/phobos/std_range_primitives.html#isInputRange");
                 }
@@ -864,6 +868,7 @@ Statement statementSemanticVisit(Statement s, Scope* sc)
         Dsymbol sapplyOld = sapply; // 'sapply' will be NULL if and after 'inferApplyArgTypes' errors
 
         /* Check for inference errors and apply modifier checks inline */
+        const errorsBeforeInfer = global.errors;
         if (!inferApplyArgTypes(fs, sc, sapply))
         {
             bool foundMismatch = false;
@@ -911,7 +916,13 @@ Statement statementSemanticVisit(Statement s, Scope* sc)
                     cast(ulong) foreachParamCount, plural, cast(ulong) dim);
             }
             else
+            {
+                const bool alreadyExplained = global.errors > errorsBeforeInfer;
                 eSink.error(fs.loc, "cannot uniquely infer `foreach` argument types");
+                if (!alreadyExplained && sapplyOld)
+                    if (auto fd = sapplyOld.isFuncDeclaration())
+                        explainForeachArgMismatch(fd, fs.parameters, fs.aggr.type.mod);
+            }
 
             return setError();
         }
@@ -929,7 +940,7 @@ Statement statementSemanticVisit(Statement s, Scope* sc)
 
         auto sym = new ScopeDsymbol();
         sym.parent = sc.scopesym;
-        sym.endlinnum = fs.endloc.linnum;
+        sym.endloc = fs.endloc;
         auto sc2 = sc.push(sym);
         sc2.inLoop = true;
 
@@ -1754,7 +1765,7 @@ Statement statementSemanticVisit(Statement s, Scope* sc)
 
         auto sym = new ScopeDsymbol();
         sym.parent = sc.scopesym;
-        sym.endlinnum = ifs.endloc.linnum;
+        sym.endloc = ifs.endloc;
         Scope* scd = sc.push(sym);
         if (ifs.param)
         {
@@ -1798,6 +1809,8 @@ Statement statementSemanticVisit(Statement s, Scope* sc)
             ifs.condition = resolveProperties(scd, ifs.condition);
             ifs.condition = ifs.condition.addDtorHook(scd);
         }
+        if (!ifs.condition.hasValidType())
+            ifs.condition = ErrorExp.get();
         if (checkNonAssignmentArrayOp(ifs.condition))
             ifs.condition = ErrorExp.get();
 
@@ -2062,7 +2075,11 @@ Statement statementSemanticVisit(Statement s, Scope* sc)
                     }
                 }
             }
-            eSink.error(gcs.loc, "`case %s` not found", gcs.exp.toErrMsg());
+            if (gcs.exp.isConst())
+                eSink.error(gcs.loc, "`case %s` not found", gcs.exp.toErrMsg());
+            else
+                eSink.error(gcs.loc, "case expression `%s` cannot be read at compile time",
+                    gcs.exp.toErrMsg());
             sc.pop();
             return setError();
         }
@@ -4284,16 +4301,8 @@ void catchSemantic(Catch c, Scope* sc)
     sym.parent = sc.scopesym;
     sc = sc.push(sym);
 
-    if (!c.type)
-    {
-        eSink.error(c.loc, "`catch` statement without an exception specification is deprecated");
-        eSink.errorSupplemental(c.loc, "use `catch(Throwable)` for old behavior");
-        c.errors = true;
-
-        // reference .object.Throwable
-        c.type = getThrowable();
-    }
-    else if (!c.type.isNaked && !c.type.isConst())
+    assert(c.type);
+    if (!c.type.isNaked && !c.type.isConst())
     {
         // @@@DEPRECATED_2.115@@@
         // Deprecated in 2.105, change into an error & uncomment assign in 2.115
@@ -5065,7 +5074,7 @@ private Statements* flatten(Statement statement, Scope* sc)
             const len = buf.length;
             buf.writeByte(0);
             const str = buf.extractSlice()[0 .. len];
-            const bool doUnittests = global.params.parsingUnittestsRequired();
+            const bool doUnittests = global.params.parsingUnittestsRequired(sc._module.isRoot);
             scope p = new Parser!ASTCodegen(sc._module, str, false, global.errorSink, &global.compileEnv, doUnittests);
             adjustLocForMixin(str, cs.loc, *p.baseLoc, global.params.mixinOut);
             p.linnum = p.baseLoc.startLine;

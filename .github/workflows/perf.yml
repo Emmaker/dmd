@@ -25,12 +25,11 @@ jobs:
       MODEL: 64
       FULL_BUILD: false
       HOST_DMD: ldc-1.42.0
-      ENABLE_LTO: 1
     defaults:
       run:
         shell: bash
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
         with:
           fetch-depth: 0
 
@@ -77,42 +76,35 @@ jobs:
         run: |
           set -uexo pipefail
           source ~/dlang/*/activate
-          built=generated/$OS_NAME/release/$MODEL
-          profile="$RUNNER_TEMP/pgo/merged.data"
           BASE_SHA="${{ steps.refs.outputs.base }}"
-          mkdir -p "$RUNNER_TEMP/pgo"
 
-          # Check out a ref and build a plain dmd + phobos
+          # Check out a ref in an isolated temp dir and clone phobos.
           setup_ref() {
             local dir="$RUNNER_TEMP/$2/dmd"
             mkdir -p "$RUNNER_TEMP/$2"
             git worktree add --force "$dir" "$1"
             ( cd "$dir" && ci/run.sh setup_repos "${{ steps.refs.outputs.branch }}" )
-            ( cd "$dir" && $DMD -of=generated/build -g compiler/src/build.d )
-            ( cd "$dir" && generated/build HOST_DMD=$DMD MODEL=$MODEL -j$N )
-            ( cd "$dir/../phobos" && make -j$N MODEL=$MODEL )
           }
 
+          # Build LTO+PGO'd dmd, druntime and phobos, Lines are tagged with the ref.
+          build_ref() {
+            make -C "$RUNNER_TEMP/$1/dmd" -j$N HOST_DMD=$DMD MODEL=$MODEL dmd-pgo 2>&1 | sed -u "s/^/[$1] /"
+          }
+
+          # Both build in parallel
           setup_ref "${{ steps.refs.outputs.head }}" head
           if [ -n "$BASE_SHA" ]; then
             setup_ref "$BASE_SHA" base
-            train=base
-          else
-            train=head
+            build_ref base & base_pid=$!
           fi
-
-          # dmd-pgo trains and rebuilds $train with the merged profile, the other ref just reuses it
-          ( cd "$RUNNER_TEMP/$train/dmd" && generated/build HOST_DMD=$DMD MODEL=$MODEL dmd-pgo -j$N --force )
-          cp "$RUNNER_TEMP/$train/dmd/$built/dmd_profdata/merged.data" "$profile"
+          build_ref head
           if [ -n "$BASE_SHA" ]; then
-            ( cd "$RUNNER_TEMP/head/dmd" && generated/build HOST_DMD=$DMD MODEL=$MODEL \
-                ENABLE_RELEASE=1 ENABLE_LTO=1 \
-                DFLAGS="-fprofile-instr-use=$profile -wi" -j$N --force )
+            wait $base_pid
           fi
           deactivate
 
       - name: Cache dub packages
-        uses: actions/cache@v4
+        uses: actions/cache@v6
         with:
           path: ~/.dub/packages
           key: dub-packages-${{ hashFiles('tools/perfrunner/workloads/vibed/dub.selections.json') }}
@@ -127,15 +119,18 @@ jobs:
           args=(
             --head-dmd "$RUNNER_TEMP/head/dmd/$built"
             --head-phobos "$RUNNER_TEMP/head/phobos"
+            --head-src "$RUNNER_TEMP/head/dmd"
             --head-sha "${{ steps.refs.outputs.head }}"
             --os ubuntu-24.04
             --host-dmd "$HOST_DMD"
+            --host-dmd-bin "$DMD"
             --out "$GITHUB_WORKSPACE/results.json"
           )
           if [ -n "$BASE_SHA" ]; then
             args+=(
               --base-dmd "$RUNNER_TEMP/base/dmd/$built"
               --base-phobos "$RUNNER_TEMP/base/phobos"
+              --base-src "$RUNNER_TEMP/base/dmd"
               --base-sha "$BASE_SHA"
               --pr "${{ github.event.pull_request.number || 0 }}"
             )
@@ -156,7 +151,7 @@ jobs:
       # perf-comment.yml picks this up and posts the comment.
       - name: Upload results
         if: github.event_name == 'pull_request'
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: perf-results
           path: results.json

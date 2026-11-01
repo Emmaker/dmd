@@ -17,8 +17,8 @@ import core.stdc.stdio;
 import core.stdc.string : memcpy;
 
 import dmd.astenums;
-import dmd.errors;
 import dmd.errorsink;
+import dmd.hdrgen : toErrMsg;
 import dmd.id;
 import dmd.identifier;
 import dmd.lexer;
@@ -421,6 +421,8 @@ final class CParser(AST) : Parser!AST
              *    statement
              */
             nextToken();
+            if (flags & ParseStatementFlags.curlyScope)
+                typedefTab.push(null);  // introduce new block scope
             AST.Statements statements;
             while (token.value != TOK.rightCurly && token.value != TOK.endOfFile)
             {
@@ -481,6 +483,7 @@ final class CParser(AST) : Parser!AST
 
             nextToken();
             check(TOK.leftParenthesis);
+            typedefTab.push(null);      // C11 6.8.5-5 a for statement is a block
             if (token.value == TOK.semicolon)
             {
                 _init = null;
@@ -2076,7 +2079,7 @@ final class CParser(AST) : Parser!AST
                         !(specifier.scw & (SCW.xextern | SCW.xstatic | SCW.x_Thread_local) || level == LVL.global))
                         initializer = new AST.VoidInitializer(token.loc);
                     auto vd = new AST.VarDeclaration(id.loc, dt, id.name, initializer, specifiersToSTC(level, specifier));
-                    specifiersToVarDeclaration(vd, specifier);
+                    specifiersToVarDeclaration(level, vd, specifier);
                     s = vd;
                 }
                 if (level != LVL.global)
@@ -2243,6 +2246,14 @@ final class CParser(AST) : Parser!AST
             }
         }
 
+        /* Parameter names hide typedefs of the same name in the function body, C11 6.2.1-4
+         */
+        foreach (i; 0 .. ft.parameterList.length)
+        {
+            if (auto pid = ft.parameterList[i].ident)
+                insertIdToTypedefTab(pid);
+        }
+
         /* gets set to true if somebody references __func__ in this function, //ditto for __FUNCTION__ */
         addFuncName = false;
         refFuncName = false;
@@ -2256,6 +2267,8 @@ final class CParser(AST) : Parser!AST
         stc &= ~STC.gshared;    // no gshared functions
         auto fd = new AST.FuncDeclaration(id.loc, prevloc, id.name, stc, ft, specifier.noreturn);
         specifiersToFuncDeclaration(fd, specifier);
+        if (fd.inlining == PINLINE.always)
+            fd.registerImportCInlineCandidate();
 
         AST.Statements stmts;
 
@@ -2625,7 +2638,7 @@ final class CParser(AST) : Parser!AST
             }
         }
 
-        specifier.scw = scw;
+        specifier.scw |= scw;
         specifier.mod = mod;
 
         // Convert TKW bits to type t
@@ -2963,6 +2976,7 @@ final class CParser(AST) : Parser!AST
                     case TOK.leftBracket:
                     {
                         // post [] syntax, pick up any leading type qualifiers, `static` and `*`
+                        const arrayLoc = token.loc;
                         AST.Type ta;
                         nextToken();
 
@@ -3003,12 +3017,9 @@ final class CParser(AST) : Parser!AST
                         // Issue errors for unsupported types.
                         if (isVLA) // C11 6.7.6.2
                         {
-                            error("variable length arrays are not supported");
+                            error(arrayLoc, "variable length arrays are not supported");
                         }
-                        if (isStatic) // C11 6.7.6.3
-                        {
-                            error("static array parameters are not supported");
-                        }
+
                         if (declarator != DTR.xparameter)
                         {
                             /* C11 6.7.6.2-4: '*' can only be used with function prototype scope.
@@ -4790,13 +4801,23 @@ final class CParser(AST) : Parser!AST
     /***********************
      * Add attributes from Specifier to variable
      * Params:
-     *  vd = function to apply them to
+     *  level = declaration context
+     *  vd = variable to apply them to
      *  specifier = specifiers
      */
-    void specifiersToVarDeclaration(AST.VarDeclaration vd, const ref Specifier specifier)
+    void specifiersToVarDeclaration(LVL level, AST.VarDeclaration vd, const ref Specifier specifier)
     {
         vd.dllImport = specifier.dllimport;
         vd.dllExport = specifier.dllexport;
+
+        // C `static` at file scope is internal linkage: invisible outside
+        // this translation unit. D's own `static` storage class doesn't
+        // restrict cross-module access the way C's does, and setting
+        // vd.visibility here directly would just get overwritten once
+        // dsymbolSemantic() runs for this declaration, so it has to be
+        // fixed up again afterwards instead - see registerImportCStaticGlobal().
+        if (level == LVL.global && (specifier.scw & SCW.xstatic))
+            vd.registerImportCStaticGlobal();
     }
 
     /***********************
@@ -5087,6 +5108,7 @@ final class CParser(AST) : Parser!AST
              */
             auto tab = cast(void*[void*])(typedefTab[$ - 1]);
             tab[cast(void*)id] = cast(void*)null;
+            typedefTab[$ - 1] = cast(void*)tab;
         }
     }
 

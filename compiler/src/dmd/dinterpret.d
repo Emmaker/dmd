@@ -115,7 +115,11 @@ public Expression ctfeInterpret(Expression e)
         result = CTFEExp.cantexp;
     }
     else
+    {
+        timeTraceBeginEvent(TimeTraceEventType.ctfeCopy);
+        scope (exit) timeTraceEndEvent(TimeTraceEventType.ctfeCopy, e);
         result = copyRegionExp(result);
+    }
 
     if (!CTFEExp.isCantExp(result))
         result = scrubReturnValue(e.loc, result);
@@ -1420,10 +1424,10 @@ Expression interpretStatement(UnionExp* pue, Statement s, InterState* istate)
         }
         if (istate.start == s)
             istate.start = null;
-        if (istate.start)
+
+        Expression e = interpretStatement(s._body, istate);
+        if (istate.start) // goto target is not in the body
         {
-            Expression e = null;
-            e = interpretStatement(pue, s._body, istate);
             foreach (ca; *s.catches)
             {
                 if (e || !istate.start) // goto target was found
@@ -1433,8 +1437,6 @@ Expression interpretStatement(UnionExp* pue, Statement s, InterState* istate)
             result = e;
             return;
         }
-
-        Expression e = interpretStatement(s._body, istate);
 
         // An exception was thrown
         if (e && e.isThrownExceptionExp())
@@ -1536,7 +1538,15 @@ Expression interpretStatement(UnionExp* pue, Statement s, InterState* istate)
             ex = bex;
         }
 
+        Statement target = istate.gotoTarget;
         Expression ey = interpretStatement(s.finalbody, istate);
+        while (CTFEExp.isGotoExp(ey))
+        {
+            istate.start = istate.gotoTarget;
+            istate.gotoTarget = null;
+            ey = interpretStatement(s.finalbody, istate);
+        }
+        istate.gotoTarget = target;
         if (CTFEExp.isCantExp(ey))
         {
             result = ey;
@@ -2059,7 +2069,7 @@ public:
         }
     }
 
-    static Expression interpretInitializerExpression(VarDeclaration v)
+    Expression interpretInitializerExpression(VarDeclaration v)
     {
         // It is a bit strange that the interpreter has to deal with initializers
         // at all as they should have been converted to ConstructExp or similar
@@ -2069,7 +2079,7 @@ public:
         // is duplicated in ExpressionSemanticVisitor.visit(AssignExp exp). Until
         // initializer semantics are removed from the interpreter, it has been
         // moved here.
-        Expression iexp = v._init.initializerToExpression(v.type);
+        Expression iexp = v._init.initializerToExpression(null, v.type, eSink);
 
         Type tb = v.type.toBasetype();
         Expression e = (iexp.op == EXP.construct || iexp.op == EXP.blit) ? (cast(AssignExp)iexp).e2 : iexp;
@@ -2171,7 +2181,7 @@ public:
                         eSink.error(loc, "CTFE internal error: trying to access uninitialized var");
                         assert(0);
                     }
-                    e = v._init.initializerToExpression();
+                    e = v._init.initializerToExpression(null, null, eSink);
                 }
                 else
                     // Zero-length arrays don't have an initializer
@@ -2239,6 +2249,19 @@ public:
         }
         else
             eSink.error(loc, "cannot interpret declaration `%s` at compile time", d.toErrMsg());
+
+        // https://issues.dlang.org/show_bug.cgi?id=21960
+        // Manifest constants (e.g. enum members) cache a shared value expression.
+        // Don't let that expression's original declaration loc leak into errors
+        // reported at a different point of use.
+        if (auto v = d.isVarDeclaration())
+        {
+            if ((v.storage_class & STC.manifest) && e && e.loc != loc)
+            {
+                e = e.copy();
+                e.loc = loc;
+            }
+        }
         return e;
     }
 
@@ -2907,7 +2930,8 @@ public:
             for (ClassDeclaration c = cd; c; c = c.baseClass)
                 totalFieldCount += c.fields.length;
 
-            totalFieldCount -= cd.hasMonitor(); // skip __monitor field
+            if (totalFieldCount)
+                totalFieldCount -= cd.hasMonitor(); // skip __monitor field
 
             auto elems = new Expressions(totalFieldCount);
             ptrdiff_t fieldsSoFar = totalFieldCount;
@@ -3335,6 +3359,17 @@ public:
 
         case EXP.equal:
         case EXP.notEqual:
+            if (auto lowering = e.isEqualExp().lowering)
+            {
+                Type tb = e.e1.type.toBasetype();
+                while (tb.isStaticOrDynamicArray())
+                    tb = tb.nextOf().toBasetype();
+                if (tb.isTypeStruct() || tb.isTypeClass())
+                {
+                    result = interpret(pue, lowering, istate);
+                    return;
+                }
+            }
             interpretCompareCommon(e, &ctfeEqual);
             return;
 
@@ -3515,6 +3550,16 @@ public:
         Expression newval = interpretRegion(e.e2, istate);
         if (exceptionOrCant(newval))
             return;
+        if (e.op == EXP.concatenateDcharAssign)
+        {
+            const c = cast(dchar)newval.toInteger();
+            if (!utf_isValidDchar(c))
+            {
+                eSink.error(e.loc, "cannot append invalid UTF character `\\U%08x` to `%s`", c, e.e1.type.toErrMsg());
+                result = CTFEExp.cantexp;
+                return;
+            }
+        }
         if (e.op == EXP.blit && newval.op == EXP.int64)
         {
             Type tbn = e.type.baseElemOf();
@@ -3569,8 +3614,14 @@ public:
                     }
                 }
                 oldval = resolveSlice(oldval);
+                if (e.e1.op == EXP.cast_)
+                {
+                    oldval = ctfeCast(pue, e.loc, e.e1.type, e.e1.type, oldval);
+                    if (oldval == pue.exp())
+                        oldval = pue.copy();
+                }
 
-                newval = (*fp)(e.loc, e.type, oldval, newval).copy();
+                newval = (*fp)(e.loc, e.e1.type, oldval, newval).copy();
             }
             else if (e.e2.type.isIntegral() &&
                      (e.op == EXP.addAssign ||
@@ -3649,7 +3700,17 @@ public:
 
         if (!isBlockAssignment)
         {
-            newval = ctfeCast(pue, e.loc, e.type, e.type, newval);
+            Type tval = e.type;
+
+            // Lazy variables are in fact delegates
+            if (auto ve = e1.isVarExp())
+            {
+                VarDeclaration v = ve.var.isVarDeclaration();
+                if (v.storage_class & STC.lazy_)
+                    tval = e.e2.type;
+            }
+
+            newval = ctfeCast(pue, e.loc, tval, tval, newval);
             if (exceptionOrCant(newval))
                 return;
             if (newval == pue.exp())
@@ -3660,7 +3721,7 @@ public:
                 result = e1;
             else
             {
-                result = ctfeCast(pue, e.loc, e.type, e.type, fp && post ? oldval : newval);
+                result = ctfeCast(pue, e.loc, tval, tval, fp && post ? oldval : newval);
                 if (result == pue.exp())
                     result = pue.copy();
             }
@@ -3732,7 +3793,7 @@ public:
                 continue;
             auto e = (*sle.elements)[i];
             if (e !is null && e.op != EXP.void_)
-                (*sle.elements)[i] = voidInitLiteral(e.type, v).copy();
+                (*sle.elements)[i] = voidInitLiteral(e.type, v2).copy();
         }
     }
 
@@ -3984,7 +4045,7 @@ public:
             else if (auto se = e1.isStringExp())
             {
                 lowerbound = 0;
-                upperbound = se.len;
+                upperbound = se.length;
             }
             else if (e1.op == EXP.null_)
             {
@@ -4916,7 +4977,7 @@ public:
             }
             if (!getValue(v))
             {
-                Expression newval = v._init.initializerToExpression();
+                Expression newval = v._init.initializerToExpression(null, null, eSink);
                 // Bug 4027. Copy constructors are a weird case where the
                 // initializer is a void function (the variable is modified
                 // through a reference parameter instead).
@@ -5214,7 +5275,7 @@ public:
             uinteger_t ilwr = se.lwr.toInteger();
             uinteger_t iupr = se.upr.toInteger();
 
-            if (index > iupr - ilwr)
+            if (index >= iupr - ilwr)
             {
                 eSink.error(e.loc, "index %llu exceeds array length %llu", index, iupr - ilwr);
                 return false;
@@ -5856,16 +5917,16 @@ public:
             if (se && se.hexString && se.postfix == StringExp.NoPostfix && e.to.nextOf().isIntegral)
             {
                 const sz = cast(size_t) e.to.nextOf().size;
-                if ((se.len % sz) != 0)
+                if ((se.length % sz) != 0)
                 {
                     eSink.error(e.loc, "hex string length %d must be a multiple of %d to cast to `%s`",
-                        cast(int) se.len, cast(int) sz, e.to.toErrMsg());
+                        cast(int) se.length, cast(int) sz, e.to.toErrMsg());
                     result = CTFEExp.cantexp;
                     return;
                 }
 
                 auto str = arrayCastBigEndian(se.peekData(), sz);
-                emplaceExp!(StringExp)(pue, e1.loc, str, se.len / sz, cast(ubyte) sz);
+                emplaceExp!(StringExp)(pue, e1.loc, str, se.length / sz, cast(ubyte) sz);
                 result = pue.exp();
                 result.type = e.to;
                 return;
@@ -5881,7 +5942,7 @@ public:
             e1 = resolveSlice(e1);
 
         auto tobt = e.to.toBasetype();
-        if (tobt.ty == Tbool && e1.type.ty == Tpointer)
+        if (tobt.ty == Tbool && (e1.type.ty == Tpointer || e1.type.ty == Tclass))
         {
             emplaceExp!(IntegerExp)(pue, e.loc, e1.op != EXP.null_, e.to);
             result = pue.exp();
@@ -7302,7 +7363,11 @@ private Expression foreachApplyUtf(UnionExp* pue, InterState* istate, Expression
                 auto slice = se.peekString();
                 errmsg = utf_decodeChar(slice, indx, rawvalue);
                 if (rvs)
+                {
+                    if (!errmsg && indx != currentIndex)
+                        errmsg = utf_decodeChar(slice, indx, rawvalue);
                     indx = saveindx;
+                }
                 break;
             }
 
@@ -7319,7 +7384,11 @@ private Expression foreachApplyUtf(UnionExp* pue, InterState* istate, Expression
                 const slice = se.peekWstring();
                 errmsg = utf_decodeWchar(slice, indx, rawvalue);
                 if (rvs)
+                {
+                    if (!errmsg && indx != currentIndex)
+                        errmsg = utf_decodeWchar(slice, indx, rawvalue);
                     indx = saveindx;
+                }
                 break;
 
             case 4:
@@ -7336,7 +7405,10 @@ private Expression foreachApplyUtf(UnionExp* pue, InterState* istate, Expression
 
         if (errmsg)
         {
-            eSink.error(deleg.loc, "`%.*s`", cast(int)errmsg.length, errmsg.ptr);
+            if (se.sz == 1)
+                eSink.error(deleg.loc, "cannot decode UTF-8 sequence starting with `\\x%02x` (%.*s)", rawvalue, cast(int)errmsg.length, errmsg.ptr);
+            else
+                eSink.error(deleg.loc, "cannot decode UTF-16 sequence starting with `\\u%04x` (%.*s)", rawvalue, cast(int)errmsg.length, errmsg.ptr);
             return CTFEExp.cantexp;
         }
 

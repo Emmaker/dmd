@@ -25,7 +25,7 @@ import dmd.dscope;
 import dmd.dstruct;
 import dmd.dsymbol;
 import dmd.dsymbolsem;
-import dmd.errors;
+import dmd.errorsink;
 import dmd.expression;
 import dmd.expressionsem;
 import dmd.func;
@@ -111,6 +111,8 @@ IntRange intRangeFromType(Type type, bool isUnsigned)
  */
 Expression implicitCastTo(Expression e, Scope* sc, Type t)
 {
+    auto eSink = global.errorSink;
+
     Expression visit(Expression e)
     {
         //printf("Expression.implicitCastTo(%s of type %s) => %s\n", e.toChars(), e.type.toChars(), t.toChars());
@@ -182,7 +184,7 @@ Expression implicitCastTo(Expression e, Scope* sc, Type t)
 
         if (!t.deco)
         {
-            error(e.loc, "forward reference to type `%s`", t.toErrMsg());
+            eSink.error(e.loc, "forward reference to type `%s`", t.toErrMsg());
             return ErrorExp.get();
         }
 
@@ -198,7 +200,7 @@ Expression implicitCastTo(Expression e, Scope* sc, Type t)
             e.type.mod == MODFlags.const_ && t.mod == 0 && e.type.hasPointers)
         {
             auto sym = e.type.isTypeStruct().sym;
-            error(e.loc, "cannot implicitly convert expression `%s` of type `%s` to `%s` because %s `%s` contains pointers or references",
+            eSink.error(e.loc, "cannot implicitly convert expression `%s` of type `%s` to `%s` because %s `%s` contains pointers or references",
                 e.toErrMsg(), ts[0], ts[1], sym.kind(), sym.toErrMsg());
             return ErrorExp.get();
         }
@@ -211,19 +213,19 @@ Expression implicitCastTo(Expression e, Scope* sc, Type t)
             // Const -> mutable conversion (disallowed)
             if (fromPointee.isConst() && !toPointee.isConst())
             {
-                error(e.loc, "cannot implicitly convert `%s` to `%s`", e.type.toErrMsg(), t.toErrMsg());
-                errorSupplemental(e.loc, "Note: Converting const to mutable requires an explicit cast (`cast(int*)`).");
+                eSink.error(e.loc, "cannot implicitly convert expression `%s` of type `%s` to `%s`", e.toErrMsg(), ts[0], ts[1]);
+                eSink.errorSupplemental(e.loc, "Note: Converting const to mutable requires an explicit cast (`cast(%s)`).", t.toChars());
                 return ErrorExp.get();
             }
             // Incompatible pointee types (e.g., int* -> float* )
             else if (fromPointee.toBasetype().ty != toPointee.toBasetype().ty)
             {
-                error(e.loc, "cannot implicitly convert `%s` to `%s`", e.type.toErrMsg(), t.toErrMsg());
-                errorSupplemental(e.loc, "Note: Pointer types point to different base types (`%s` vs `%s`)", fromPointee.toChars(), toPointee.toChars());
+                eSink.error(e.loc, "cannot implicitly convert expression `%s` of type `%s` to `%s`", e.toErrMsg(), ts[0], ts[1]);
+                eSink.errorSupplemental(e.loc, "Note: Pointer types point to different base types (`%s` vs `%s`)", fromPointee.toChars(), toPointee.toChars());
                 return ErrorExp.get();
             }
         }
-        error(e.loc, "cannot implicitly convert expression `%s` of type `%s` to `%s`", e.toErrMsg(), ts[0], ts[1]);
+        eSink.error(e.loc, "cannot implicitly convert expression `%s` of type `%s` to `%s`", e.toErrMsg(), ts[0], ts[1]);
 
         return ErrorExp.get();
     }
@@ -311,6 +313,8 @@ Expression implicitCastTo(Expression e, Scope* sc, Type t)
  */
 MATCH implicitConvTo(Expression e, Type t)
 {
+    auto eSink = global.errorSink;
+
     MATCH visit(Expression e)
     {
         version (none)
@@ -322,7 +326,7 @@ MATCH implicitConvTo(Expression e, Type t)
             return MATCH.nomatch;
         if (!e.type)
         {
-            error(e.loc, "`%s` is not an expression", e.toErrMsg());
+            eSink.error(e.loc, "`%s` is not an expression", e.toErrMsg());
             e.type = Type.terror;
         }
 
@@ -727,7 +731,7 @@ MATCH implicitConvTo(Expression e, Type t)
                     string s;
                     size_t fromlen = e.numberOfCodeUnits(tynto, s);
                     if (s)
-                        error(e.loc, "%.*s", cast(int)s.length, s.ptr);
+                        eSink.error(e.loc, "%.*s", cast(int)s.length, s.ptr);
                     size_t tolen = cast(size_t)t.isTypeSArray().dim.toInteger();
                     if (tolen < fromlen)
                         return MATCH.nomatch;
@@ -752,7 +756,7 @@ MATCH implicitConvTo(Expression e, Type t)
                     string s;
                     size_t fromlen = e.numberOfCodeUnits(tynto, s);
                     if (s)
-                        error(e.loc, "%.*s", cast(int)s.length, s.ptr);
+                        eSink.error(e.loc, "%.*s", cast(int)s.length, s.ptr);
                     size_t tolen = cast(size_t)t.isTypeSArray().dim.toInteger();
                     if (tolen < fromlen)
                         return MATCH.nomatch;
@@ -789,7 +793,7 @@ MATCH implicitConvTo(Expression e, Type t)
                 if (e.type.ty == t.ty && e.type.nextOf().ty == tn.ty)
                     return m;
             }
-            if (e.type != t && e.hexString && tn.isIntegral && (tn.size == e.sz || (!e.committed && (e.len % tn.size) == 0)))
+            if (e.type != t && e.hexString && tn.isIntegral && (tn.size == e.sz || (!e.committed && (e.length % tn.size) == 0)))
             {
                 m = MATCH.convert;
                 return m;
@@ -1095,10 +1099,23 @@ MATCH implicitConvTo(Expression e, Type t)
             typeb.ty == Tpointer && typeb.nextOf().ty == Tfunction &&
             tb.ty == Tpointer && tb.nextOf().ty == Tfunction)
         {
-            /* I don't think this can ever happen -
-             * it should have been
-             * converted to a SymOffExp.
+            /* Normally this can't happen - it should have been
+             * converted to a SymOffExp by optimize(). But optimize()
+             * deliberately skips that conversion for an imported
+             * (export/dllimport) symbol, and the general check above
+             * (e.type.implicitConvTo(t)) does not always short-circuit
+             * before reaching here for such a symbol (e.g. when its
+             * function type has non-default linkage, such as
+             * extern(Windows)). Treat that known case as a plain
+             * non-match instead of asserting; the existing CTFE-time
+             * check in dinterpret.d still correctly reports a proper
+             * diagnostic when its address is actually taken.
              */
+            if (auto ve = e.e1.isVarExp())
+            {
+                if (ve.var.isImportedSymbol())
+                    return MATCH.nomatch;
+            }
             assert(0);
         }
 
@@ -2110,6 +2127,7 @@ Type toStaticArrayType(SliceExp e)
 Expression castTo(Expression e, Scope* sc, Type t, Type att = null)
 {
     //printf("castTo(e: %s from: %s to: %s\n", e.toChars(), e.type.toChars(), t.toChars());
+    auto eSink = global.errorSink;
 
     Expression visit(Expression e)
     {
@@ -2208,7 +2226,7 @@ Expression castTo(Expression e, Scope* sc, Type t, Type att = null)
                 if (auto result = tryAliasThisCast())
                     return result;
             }
-            error(e.loc, "cannot cast expression `%s` of type `%s` to `%s`", e.toErrMsg(), e.type.toErrMsg(), t.toErrMsg());
+            eSink.error(e.loc, "cannot cast expression `%s` of type `%s` to `%s`", e.toErrMsg(), e.type.toErrMsg(), t.toErrMsg());
             return ErrorExp.get();
         }
 
@@ -2290,7 +2308,7 @@ Expression castTo(Expression e, Scope* sc, Type t, Type att = null)
                 return ok();
 
             auto ts = toAutoQualChars(e.type, t);
-            error(e.loc, "cannot cast expression `%s` of type `%s` to `%s` because of different sizes",
+            eSink.error(e.loc, "cannot cast expression `%s` of type `%s` to `%s` because of different sizes",
                 e.toErrMsg(), ts[0], ts[1]);
             return ErrorExp.get();
         }
@@ -2319,7 +2337,7 @@ Expression castTo(Expression e, Scope* sc, Type t, Type att = null)
                     const dim = t1b.isTypeSArray().dim.toInteger();
                     if (tsize == 0 || (dim * fsize) % tsize != 0)
                     {
-                        error(e.loc, "cannot cast expression `%s` of type `%s` to `%s` since sizes don't line up",
+                        eSink.error(e.loc, "cannot cast expression `%s` of type `%s` to `%s` since sizes don't line up",
                                 e.toErrMsg(), e.type.toErrMsg(), t.toErrMsg());
                         return ErrorExp.get();
                     }
@@ -2362,7 +2380,7 @@ Expression castTo(Expression e, Scope* sc, Type t, Type att = null)
                 // void delegate() dg;
                 // cast(U*)dg; // ==> cast(U*)dg.ptr;
                 // Note that it happens even when U is a Tfunction!
-                deprecation(e.loc, "casting from %s to %s is deprecated", e.type.toErrMsg(), t.toErrMsg());
+                eSink.deprecation(e.loc, "casting from %s to %s is deprecated", e.type.toErrMsg(), t.toErrMsg());
                 return ok();
             }
             return fail();
@@ -2432,7 +2450,7 @@ Expression castTo(Expression e, Scope* sc, Type t, Type att = null)
         if (!e.committed && t.ty == Tpointer && t.nextOf().ty == Tvoid &&
             (!sc || !sc.inCfile))
         {
-            error(e.loc, "cannot convert string literal to `void*`");
+            eSink.error(e.loc, "cannot convert string literal to `void*`");
             return ErrorExp.get();
         }
 
@@ -2463,7 +2481,7 @@ Expression castTo(Expression e, Scope* sc, Type t, Type att = null)
         if (e.hexString && !e.committed && tb.nextOf() && tb.nextOf().isIntegral)
         {
             const szx = cast(ubyte) tb.nextOf().size();
-            if (szx != se.sz && (e.len % szx) == 0)
+            if (szx != se.sz && (e.length % szx) == 0)
             {
                 import dmd.utils: arrayCastBigEndian;
                 const data = e.peekData();
@@ -2502,21 +2520,21 @@ Expression castTo(Expression e, Scope* sc, Type t, Type att = null)
             uinteger_t szx = tb.nextOf().size();
             assert(szx <= 255);
             se.sz = cast(ubyte)szx;
-            se.len = cast(size_t)tb.isTypeSArray().dim.toInteger();
+            se.length = cast(size_t)tb.isTypeSArray().dim.toInteger();
             se.committed = true;
             se.type = t;
 
             /* If larger than source, pad with zeros.
              */
-            const fullSize = (se.len + 1) * se.sz; // incl. terminating 0
-            if (fullSize > (e.len + 1) * e.sz)
+            const fullSize = (se.length + 1) * se.sz; // incl. terminating 0
+            if (fullSize > (e.length + 1) * e.sz)
             {
                 void* s = mem.xmalloc_noscan(fullSize);
-                const srcSize = e.len * e.sz;
+                const srcSize = e.length * e.sz;
                 const data = se.peekData();
                 memcpy(s, data.ptr, srcSize);
                 memset(s + srcSize, 0, fullSize - srcSize);
-                se.setData(s, se.len, se.sz);
+                se.setData(s, se.length, se.sz);
             }
             return se;
         }
@@ -2579,11 +2597,11 @@ Expression castTo(Expression e, Scope* sc, Type t, Type att = null)
                 break;
 
             case X(Tchar, Twchar):
-                for (size_t u = 0; u < e.len;)
+                for (size_t u = 0; u < e.length;)
                 {
                     dchar c;
                     if (const s = utf_decodeChar(se.peekString(), u, c))
-                        error(e.loc, "%.*s", cast(int)s.length, s.ptr);
+                        eSink.error(e.loc, "%.*s", cast(int)s.length, s.ptr);
                     else
                         buffer.writeUTF16(c);
                 }
@@ -2592,11 +2610,11 @@ Expression castTo(Expression e, Scope* sc, Type t, Type att = null)
                 goto L1;
 
             case X(Tchar, Tdchar):
-                for (size_t u = 0; u < e.len;)
+                for (size_t u = 0; u < e.length;)
                 {
                     dchar c;
                     if (const s = utf_decodeChar(se.peekString(), u, c))
-                        error(e.loc, "%.*s", cast(int)s.length, s.ptr);
+                        eSink.error(e.loc, "%.*s", cast(int)s.length, s.ptr);
                     buffer.write4(c);
                     newlen++;
                 }
@@ -2604,11 +2622,11 @@ Expression castTo(Expression e, Scope* sc, Type t, Type att = null)
                 goto L1;
 
             case X(Twchar, Tchar):
-                for (size_t u = 0; u < e.len;)
+                for (size_t u = 0; u < e.length;)
                 {
                     dchar c;
                     if (const s = utf_decodeWchar(se.peekWstring(), u, c))
-                        error(e.loc, "%.*s", cast(int)s.length, s.ptr);
+                        eSink.error(e.loc, "%.*s", cast(int)s.length, s.ptr);
                     else
                         buffer.writeUTF8(c);
                 }
@@ -2617,11 +2635,11 @@ Expression castTo(Expression e, Scope* sc, Type t, Type att = null)
                 goto L1;
 
             case X(Twchar, Tdchar):
-                for (size_t u = 0; u < e.len;)
+                for (size_t u = 0; u < e.length;)
                 {
                     dchar c;
                     if (const s = utf_decodeWchar(se.peekWstring(), u, c))
-                        error(e.loc, "%.*s", cast(int)s.length, s.ptr);
+                        eSink.error(e.loc, "%.*s", cast(int)s.length, s.ptr);
                     buffer.write4(c);
                     newlen++;
                 }
@@ -2629,11 +2647,11 @@ Expression castTo(Expression e, Scope* sc, Type t, Type att = null)
                 goto L1;
 
             case X(Tdchar, Tchar):
-                for (size_t u = 0; u < e.len; u++)
+                for (size_t u = 0; u < e.length; u++)
                 {
                     uint c = se.peekDstring()[u];
                     if (!utf_isValidDchar(c))
-                        error(e.loc, "invalid UCS-32 char \\U%08x", c);
+                        eSink.error(e.loc, "invalid UCS-32 char \\U%08x", c);
                     else
                         buffer.writeUTF8(c);
                     newlen++;
@@ -2643,11 +2661,11 @@ Expression castTo(Expression e, Scope* sc, Type t, Type att = null)
                 goto L1;
 
             case X(Tdchar, Twchar):
-                for (size_t u = 0; u < e.len; u++)
+                for (size_t u = 0; u < e.length; u++)
                 {
                     uint c = se.peekDstring()[u];
                     if (!utf_isValidDchar(c))
-                        error(e.loc, "invalid UCS-32 char \\U%08x", c);
+                        eSink.error(e.loc, "invalid UCS-32 char \\U%08x", c);
                     else
                         buffer.writeUTF16(c);
                     newlen++;
@@ -2685,11 +2703,11 @@ Expression castTo(Expression e, Scope* sc, Type t, Type att = null)
             //printf("dim from = %d, to = %d\n", cast(int)se.len, cast(int)dim2);
 
             // Changing dimensions
-            if (dim2 != se.len)
+            if (dim2 != se.length)
             {
                 // Copy when changing the string literal
                 const newsz = se.sz;
-                const d = (dim2 < se.len) ? dim2 : se.len;
+                const d = (dim2 < se.length) ? dim2 : se.length;
                 void* s = mem.xmalloc_noscan((dim2 + 1) * newsz);
                 memcpy(s, se.peekData().ptr, d * newsz);
                 // Extend with 0, add terminating 0
@@ -2996,7 +3014,7 @@ Expression castTo(Expression e, Scope* sc, Type t, Type att = null)
                     }
                     else if (f.needThis())
                     {
-                        error(e.loc, "no `this` to create delegate for `%s`", f.toErrMsg());
+                        eSink.error(e.loc, "no `this` to create delegate for `%s`", f.toErrMsg());
                         return ErrorExp.get();
                     }
                     else if (f.isNested())
@@ -3006,7 +3024,7 @@ Expression castTo(Expression e, Scope* sc, Type t, Type att = null)
                     }
                     else
                     {
-                        error(e.loc, "cannot cast from function pointer to delegate");
+                        eSink.error(e.loc, "cannot cast from function pointer to delegate");
                         return ErrorExp.get();
                     }
                 }
@@ -3039,7 +3057,7 @@ Expression castTo(Expression e, Scope* sc, Type t, Type att = null)
         }
         void errorCovariantReturnType()
         {
-            error(e.loc, "cannot form delegate due to covariant return type");
+            eSink.error(e.loc, "cannot form delegate due to covariant return type");
         }
 
         Type tb = t.toBasetype();
@@ -3202,7 +3220,7 @@ Expression castTo(Expression e, Scope* sc, Type t, Type att = null)
             }
         }
         auto ts = toAutoQualChars(tsa ? tsa : e.type, t);
-        error(e.loc, "cannot cast expression `%s` of type `%s` to `%s`",
+        eSink.error(e.loc, "cannot cast expression `%s` of type `%s` to `%s`",
             e.toErrMsg(), ts[0], ts[1]);
         return ErrorExp.get();
     }
@@ -4346,7 +4364,8 @@ Expression integralPromotions(Expression e, Scope* sc)
     switch (e.type.toBasetype().ty)
     {
     case Tvoid:
-        error(e.loc, "void has no value");
+        auto eSink = global.errorSink;
+        eSink.error(e.loc, "void has no value");
         return ErrorExp.get();
 
     case Tint8:
@@ -4397,8 +4416,10 @@ void fix16997(Scope* sc, UnaExp ue)
         case Tchar:
         case Twchar:
         case Tdchar:
-            deprecation(ue.loc, "integral promotion not done for `%s`, remove '-revert=intpromote' switch or `%scast(int)(%s)`",
-                ue.toErrMsg(), EXPtoString(ue.op).ptr, ue.e1.toErrMsg());
+            // https://github.com/dlang/dmd/issues/17834
+            auto eSink = global.errorSink;
+            eSink.deprecation(ue.loc, "integral promotion not done for `%s` (operand type `%s`), remove '-revert=intpromote' switch or rewrite as `%scast(int)(%s)`",
+                ue.toErrMsg(), ue.e1.type.toErrMsg(), EXPtoString(ue.op).ptr, ue.e1.toErrMsg());
             return;
 
         default:

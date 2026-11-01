@@ -37,6 +37,7 @@ import dmd.root.port;
 import dmd.root.rmem;
 import dmd.tokens;
 import dmd.typesem;
+import dmd.timetrace;
 
 /****************************************************************/
 /* A type meant as a union of all the Expression types,
@@ -78,7 +79,7 @@ extern (D) struct UnionExp
 
 private:
     // Ensure that the union is suitably aligned.
-    align(8) union _AnonStruct_u
+    align(real_t.alignof > 8 ? real_t.alignof : 8) union _AnonStruct_u
     {
         char[__traits(classInstanceSize, Expression)] exp;
         char[__traits(classInstanceSize, IntegerExp)] integerexp;
@@ -206,7 +207,7 @@ private Expressions* copyLiteralArray(Expressions* oldelems)
     auto newelems = new Expressions(oldelems.length);
     foreach (i, el; *oldelems)
     {
-        (*newelems)[i] = el ? copyLiteral(el).copy() : null;
+        (*newelems)[i] = el ? copyLiteralImpl(el).copy() : null;
     }
     return newelems;
 }
@@ -228,15 +229,15 @@ private Expressions* copyLiteralArrayExpand(Expressions* oldelems, Expression ba
 
 // Make a copy of the ArrayLiteral, AALiteral, String, or StructLiteral.
 // This value will be used for in-place modification.
-UnionExp copyLiteral(Expression e)
+UnionExp copyLiteralImpl(Expression e)
 {
     UnionExp ue = void;
     if (auto se = e.isStringExp()) // syntaxCopy doesn't make a copy for StringExp!
     {
-        char* s = cast(char*)mem.xcalloc(se.len + 1, se.sz);
+        char* s = cast(char*)mem.xcalloc(se.length + 1, se.sz);
         const slice = se.peekData();
         memcpy(s, slice.ptr, slice.length);
-        emplaceExp!(StringExp)(&ue, se.loc, s[0 .. se.len * se.sz], se.len, se.sz);
+        emplaceExp!(StringExp)(&ue, se.loc, s[0 .. se.length * se.sz], se.length, se.sz);
         StringExp se2 = ue.exp().isStringExp();
         se2.committed = se.committed;
         se2.postfix = se.postfix;
@@ -247,7 +248,7 @@ UnionExp copyLiteral(Expression e)
     if (auto ale = e.isArrayLiteralExp())
     {
         auto elements = copyLiteralArray(ale.elements);
-        auto basis = ale.basis ? copyLiteral(ale.basis).copy() : null;
+        auto basis = ale.basis ? copyLiteralImpl(ale.basis).copy() : null;
 
         emplaceExp!(ArrayLiteralExp)(&ue, e.loc, e.type, basis, elements);
 
@@ -290,7 +291,7 @@ UnionExp copyLiteral(Expression e)
             else
             {
                 // Buzilla 15681: Copy the source element always.
-                m = copyLiteral(m).copy();
+                m = copyLiteralImpl(m).copy();
 
                 // Block assignment from inside struct literals
                 if (v.type.ty != m.type.ty && v.type.ty == Tsarray)
@@ -517,7 +518,7 @@ uinteger_t resolveArrayLength(Expression e)
         }
 
         case EXP.string_:
-            return e.isStringExp().len;
+            return e.isStringExp().length;
 
         case EXP.arrayLiteral:
         {
@@ -874,7 +875,8 @@ Expression pointerArithmetic(UnionExp* pue, Loc loc, EXP op, Type type, Expressi
         eSink.error(loc, "CTFE internal error: pointer arithmetic `%s`", agg1.toErrMsg());
         return cant();
     }
-    if (auto tsa = eptr.type.toBasetype().isTypeSArray())
+    auto tsa = eptr.type.toBasetype().isTypeSArray();
+    if (tsa && !tsa.equivalent(pointee))
     {
         dinteger_t dim = tsa.dim.toInteger();
         // Create a CTFE pointer &agg1[indx .. indx+dim]
@@ -1197,7 +1199,9 @@ private int ctfeRawCmp(Loc loc, Expression e1, Expression e2, bool identity = fa
         dinteger_t ofs1, ofs2;
         Expression agg1 = getAggregateFromPointer(e1, &ofs1);
         Expression agg2 = getAggregateFromPointer(e2, &ofs2);
-        if ((agg1 == agg2) || (agg1.op == EXP.variable && agg2.op == EXP.variable && agg1.isVarExp().var == agg2.isVarExp().var))
+        if ((agg1 == agg2) ||
+            (agg1.op == EXP.variable && agg2.op == EXP.variable && agg1.isVarExp().var == agg2.isVarExp().var) ||
+            (agg1.op == EXP.symbolOffset && agg2.op == EXP.symbolOffset && agg1.isSymOffExp().var == agg2.isSymOffExp().var))
         {
             if (ofs1 == ofs2)
                 return 0;
@@ -1407,7 +1411,7 @@ UnionExp ctfeCat(Loc loc, Type type, Expression e1, Expression e2)
         // [chars] ~ string => string (only valid for CTFE)
         StringExp es1 = e2.isStringExp();
         ArrayLiteralExp ale2 = e1.isArrayLiteralExp();
-        const len = es1.len + ale2.length;
+        const len = es1.length + ale2.length;
         const sz = es1.sz;
         void* s = mem.xmalloc_noscan((len + 1) * sz);
         const data1 = es1.peekData();
@@ -1437,7 +1441,7 @@ UnionExp ctfeCat(Loc loc, Type type, Expression e1, Expression e2)
         // Concatenate the strings
         StringExp es1 = e1.isStringExp();
         ArrayLiteralExp ale2 = e2.isArrayLiteralExp();
-        const len = es1.len + ale2.length;
+        const len = es1.length + ale2.length;
         const sz = es1.sz;
         void* s = mem.xmalloc_noscan((len + 1) * sz);
         auto slice = es1.peekData();
@@ -1451,7 +1455,7 @@ UnionExp ctfeCat(Loc loc, Type type, Expression e1, Expression e2)
                 return ue;
             }
             const v = es2e.toInteger();
-            Port.valcpy(cast(char*)s + (es1.len + i) * sz, v, sz);
+            Port.valcpy(cast(char*)s + (es1.length + i) * sz, v, sz);
         }
         // Add terminating 0
         memset(cast(char*)s + len * sz, 0, sz);
@@ -1520,10 +1524,10 @@ Expression ctfeIndex(UnionExp* pue, Loc loc, Type type, Expression e1, uinteger_
     assert(e1.type);
     if (auto es1 = e1.isStringExp())
     {
-        if (indx >= es1.len)
+        if (indx >= es1.length)
         {
             auto eSink = global.errorSink;
-            eSink.error(loc, "string index %llu is out of bounds `[0 .. %llu]`", indx, cast(ulong)es1.len);
+            eSink.error(loc, "string index %llu is out of bounds `[0 .. %llu]`", indx, cast(ulong)es1.length);
             return CTFEExp.cantexp;
         }
         emplaceExp!IntegerExp(pue, loc, es1.getIndex(cast(size_t) indx), type);
@@ -2100,4 +2104,11 @@ UnionExp voidInitLiteral(Type t, VarDeclaration var)
     else
         emplaceExp!(VoidInitExp)(&ue, var);
     return ue;
+}
+
+UnionExp copyLiteral(Expression e)
+{
+    timeTraceBeginEvent(TimeTraceEventType.ctfeLiteralCopy);
+    scope (exit) timeTraceEndEvent(TimeTraceEventType.ctfeLiteralCopy, e);
+    return copyLiteralImpl(e);
 }

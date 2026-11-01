@@ -36,23 +36,6 @@ template Unqual(T : const U, U)
         alias Unqual = U;
 }
 
-template Unshared(T)
-{
-    static if (is(T == shared U, U))
-        alias Unshared = U;
-    else
-        alias Unshared = T;
-}
-
-unittest
-{
-    static assert(is(Unshared!int == int));
-    static assert(is(Unshared!(shared int) == int));
-    static assert(is(Unshared!(const int) == const int));
-    static assert(is(Unshared!(shared const int) == const int));
-    static assert(is(Unshared!(immutable int) == immutable int));
-}
-
 template BaseElemOf(T)
 {
     static if (is(OriginalType!T == E[N], E, size_t N))
@@ -292,8 +275,8 @@ template hasElaborateMove(S)
     }
     else static if (is(S == struct))
     {
-        enum hasElaborateMove = (is(typeof(S.init.opPostMove(lvalueOf!S))) &&
-                                    !is(typeof(S.init.opPostMove(rvalueOf!S)))) ||
+        enum hasElaborateMove = (is(typeof(lvalueOf!S.opPostMove(lvalueOf!S))) &&
+                                    !is(typeof(lvalueOf!S.opPostMove(rvalueOf!S)))) ||
                                 anySatisfy!(.hasElaborateMove, Fields!S);
     }
     else
@@ -395,7 +378,7 @@ template hasElaborateCopyConstructor(S)
     static struct S
     {
         int x;
-        this(this) { }
+        this(return scope ref typeof(this) rhs) { }
         this(int x, int y) {}
     }
 
@@ -413,7 +396,7 @@ template hasElaborateCopyConstructor(S)
     static struct S3
     {
         int x;
-        this(this) { }
+        this(return scope ref typeof(this) rhs, int x = 42) { }
         this(int x, int y) {}
     }
 
@@ -432,8 +415,8 @@ template hasElaborateAssign(S)
     }
     else static if (is(S == struct))
     {
-        enum hasElaborateAssign = is(typeof(S.init.opAssign(rvalueOf!S))) ||
-                                  is(typeof(S.init.opAssign(lvalueOf!S)));
+        enum hasElaborateAssign = is(typeof(lvalueOf!S.opAssign(rvalueOf!S))) ||
+                                  is(typeof(lvalueOf!S.opAssign(lvalueOf!S)));
     }
     else
     {
@@ -844,13 +827,27 @@ template DynamicArrayTypeOf(T)
         static assert(0, T.stringof ~ " is not a dynamic array");
 }
 
+@safe unittest
+{
+    static struct Slice { int[] a; alias a this; }
+    static struct Nested { Slice s; alias s this; }
+    static struct Fixed { int[4] a; alias a this; }
+
+    static assert(is(DynamicArrayTypeOf!(int[]) == int[]));
+    static assert(is(DynamicArrayTypeOf!Slice == int[]));
+    static assert(is(DynamicArrayTypeOf!(const Slice) == const(int[])));
+    static assert(is(DynamicArrayTypeOf!Nested == int[]));
+    static assert(!is(DynamicArrayTypeOf!Fixed));
+    static assert(!is(DynamicArrayTypeOf!int));
+}
+
 private template AliasThisTypeOf(T)
     if (isAggregateType!T)
 {
     alias members = __traits(getAliasThis, T);
 
     static if (members.length == 1)
-        alias AliasThisTypeOf = typeof(__traits(getMember, T.init, members[0]));
+        alias AliasThisTypeOf = typeof(__traits(getMember, lvalueOf!T, members[0]));
     else
         static assert(0, T.stringof~" does not have alias this type");
 }

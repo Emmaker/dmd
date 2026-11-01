@@ -19,6 +19,7 @@ module core.sync.rwmutex;
 public import core.sync.exception;
 import core.sync.condition;
 import core.sync.mutex;
+import core.thread : isSingleThreaded;
 import core.memory;
 import core.atomic : atomicLoad;
 
@@ -562,8 +563,7 @@ private:
 // Unit Tests
 ////////////////////////////////////////////////////////////////////////////////
 
-version (WASI) {} // WASI is single-threaded
-else
+static if(!isSingleThreaded)
 unittest
 {
     import core.atomic, core.thread, core.sync.semaphore;
@@ -601,13 +601,10 @@ unittest
         {
             for (;;)
             {
-                // This unittest needs the implementation object to inspect
-                // private counters that are protected by m_commonMutex.
-                auto localMutex = (() @trusted => cast(ReadWriteMutex) atomicLoad(mutex))();
-                synchronized (localMutex.m_commonMutex)
+                synchronized (mutex.m_commonMutex)
                 {
-                    if (localMutex.m_numQueuedReaders == queuedReaders &&
-                        localMutex.m_numQueuedWriters == queuedWriters)
+                    if (mutex.m_numQueuedReaders == queuedReaders &&
+                        mutex.m_numQueuedWriters == queuedWriters)
                         break;
                 }
                 Thread.yield();
@@ -703,8 +700,7 @@ unittest
     runTest(ReadWriteMutex.Policy.PREFER_WRITERS);
 }
 
-version (WASI) {} // WASI is single-threaded
-else
+static if(!isSingleThreaded)
 unittest
 {
     import core.atomic, core.thread;
@@ -781,8 +777,7 @@ unittest
     }
 }
 
-version (WASI) {} // WASI is single-threaded
-else
+static if(!isSingleThreaded)
 unittest
 {
     import core.atomic, core.thread, core.sync.semaphore;
@@ -924,8 +919,7 @@ unittest
     runTest(ReadWriteMutex.Policy.PREFER_WRITERS);
 }
 
-version (WASI) {} // WASI is single-threaded
-else
+static if(!isSingleThreaded)
 unittest
 {
     import core.atomic, core.thread;
